@@ -1,3 +1,9 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//        http://www.apache.org/licenses/LICENSE-2.0
+
 //+build mage
 
 package main
@@ -120,7 +126,8 @@ func Build(ctx context.Context) error {
 			clitool.BoolFlag("-fmt", true),
 			clitool.Flag("-version", defaultVersion),
 			clitool.Flag("-out", "ecs/ecs.go"),
-			clitool.Flag("-schema", filepath.Join(ecsDir, "schemas")),
+			clitool.Flag("-e", "tags"),
+			clitool.Positional(filepath.Join(ecsDir, "generated/ecs/ecs_flat.yml")),
 		),
 	)
 }

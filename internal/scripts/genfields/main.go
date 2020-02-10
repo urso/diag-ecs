@@ -1,3 +1,9 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//        http://www.apache.org/licenses/LICENSE-2.0
+
 package main
 
 import (
@@ -7,6 +13,7 @@ import (
 	"go/format"
 	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -17,6 +24,7 @@ import (
 
 type schema struct {
 	Version    string
+	Base       map[string]*value     // toplevel values
 	Top        map[string]*namespace // toplevel namespaces
 	Namespaces map[string]*namespace // all namespaces with full name
 	Values     map[string]*value     // all values with full name in schema
@@ -26,7 +34,7 @@ type namespace struct {
 	Parent *namespace
 
 	Name        string
-	FullName    string
+	FlatName    string
 	Description string
 
 	Children []*namespace
@@ -37,7 +45,7 @@ type value struct {
 	Parent      *namespace
 	Type        typeInfo
 	Name        string
-	FullName    string
+	FlatName    string
 	Description string
 }
 
@@ -52,7 +60,18 @@ type definition struct {
 	Name        string
 	Type        string
 	Description string
-	Fields      []definition
+	Fields      map[string]definition
+}
+
+type stringsFlag []string
+
+func (f *stringsFlag) String() string {
+	return strings.Join(([]string)(*f), ",")
+}
+
+func (f *stringsFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
 }
 
 var (
@@ -81,10 +100,10 @@ var codeTmpl = `
 
 	type (
 	{{ range $ns := .schema.Namespaces }}
-	  ns{{ $ns.FullName | goName }} struct {
+	  ns{{ $ns.FlatName | goName }} struct {
 		  {{ range $sub := $ns.Children }}
 			{{ $sub.Description | goComment }}
-			{{ $sub.Name | goName }} ns{{ $sub.FullName | goName }}
+			{{ $sub.Name | goName }} ns{{ $sub.FlatName | goName }}
 			{{ end }}
 		}
 	{{ end }}
@@ -92,12 +111,13 @@ var codeTmpl = `
 
 	var (
 	{{ range $ns := .schema.Top }}
-	  // {{ $ns.Name | goName }} provides fields in the ECS {{ $ns.FullName }} namespace.
-		{{ $ns.Description | goComment }}
-	  {{ $ns.Name | goName }} = ns{{ $ns.FullName | goName }}{}
+	  // {{ $ns.Name | goName }} provides fields in the ECS {{ $ns.FlatName }} namespace.
+		{{ if $ns.Description -}}{{ $ns.Description | goComment }}{{ end -}}
+	  {{ $ns.Name | goName }} = ns{{ $ns.FlatName | goName }}{}
 	{{ end }}
 	)
 
+  // Version is the current ECS version available in the ecs package.
 	const Version = "{{ .schema.Version }}"
 
   func ecsField(key string, val diag.Value) diag.Field {
@@ -113,16 +133,27 @@ var codeTmpl = `
   func ecsInt64(key string, val int64) diag.Field       { return ecsField(key, diag.ValInt64(val)) }
   func ecsFloat64(key string, val float64) diag.Field   { return ecsField(key, diag.ValFloat(val)) }
 
+	{{ range $value := .schema.Base }}
+		{{ if ne $value.Type.Constructor "Any" }}
+	  // {{ $value.Name | goName }} create the ECS complain '{{ $value.FlatName}}' field.
+	  {{ $value.Description | goComment }}
+		func {{ $value.Name | goName }}(value {{ $value.Type.Name }}) diag.Field {
+					return ecs{{ $value.Type.Constructor }}("{{ $value.FlatName }}", value)
+		}
+		{{ end }}
+
+	{{ end }}
+
 	{{ range $ns := .schema.Namespaces }}
-	// ## {{ $ns.FullName }} fields
+	// ## {{ $ns.FlatName }} fields
 
     {{ range $value := $ns.Values }}
 		{{/* Filter out generic object types that would accept a map[string]interface */}}
 		{{ if ne $value.Type.Constructor "Any" }}
-			// {{ $value.Name | goName }} create the ECS complain '{{ $value.FullName}}' field.
+			// {{ $value.Name | goName }} create the ECS complain '{{ $value.FlatName}}' field.
 			{{ $value.Description | goComment }}
-			func (ns{{ $ns.FullName | goName }}) {{ $value.Name | goName }}(value {{ $value.Type.Name }}) diag.Field {
-					return ecs{{ $value.Type.Constructor }}("{{ $value.FullName }}", value)
+			func (ns{{ $ns.FlatName | goName }}) {{ $value.Name | goName }}(value {{ $value.Type.Name }}) diag.Field {
+					return ecs{{ $value.Type.Constructor }}("{{ $value.FlatName }}", value)
 			}
 			{{ end }}
 		{{ end }}
@@ -131,25 +162,34 @@ var codeTmpl = `
 
 func main() {
 	var (
-		schemaDir string
-		pkgName   string
-		outFile   string
-		version   string
-		fmtCode   bool
+		pkgName string
+		outFile string
+		version string
+		fmtCode bool
+		exclude []string
 	)
 
 	log.SetFlags(0)
-	flag.StringVar(&schemaDir, "schema", "", "Schema directory containing .yml files (required)")
 	flag.StringVar(&pkgName, "pkg", "ecs", "Target package name")
 	flag.StringVar(&outFile, "out", "", "Output directory (required)")
 	flag.StringVar(&version, "version", "", "ECS version (required)")
 	flag.BoolVar(&fmtCode, "fmt", false, "Format output")
+	flag.Var((*stringsFlag)(&exclude), "e", "exclude fields")
 	flag.Parse()
+	files := flag.Args()
 
-	checkFlag("schema", schemaDir)
+	if len(files) == 0 {
+		log.Fatal("No schema files given")
+	}
+
 	checkFlag("version", version)
 
-	schema, err := loadSchema(version, schemaDir)
+	ignoreNames := map[string]bool{}
+	for _, name := range exclude {
+		ignoreNames[name] = true
+	}
+
+	schema, err := loadSchema(version, files, ignoreNames)
 	if err != nil {
 		log.Fatalf("Error loading schema: %+v", err)
 	}
@@ -205,47 +245,62 @@ func execTemplate(tmpl, pkgName string, schema *schema) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func loadSchema(version, root string) (*schema, error) {
-	defs, err := loadDefs(root)
+func loadSchema(version string, paths []string, exclude map[string]bool) (*schema, error) {
+	defs, err := loadDefs(paths)
 	if err != nil {
 		return nil, err
 	}
 
-	schema := buildSchema(version, flattenDefs("", defs))
+	schema := buildSchema(version, flattenDefs("", defs), exclude)
 	copyDescriptions(schema, "", defs)
 	return schema, nil
 }
 
-func loadDefs(root string) ([]definition, error) {
-	files, err := filepath.Glob(filepath.Join(root, "*.yml"))
-	if err != nil {
-		return nil, fmt.Errorf("finding yml files in '%v' failed: %+v", root, err)
+func loadDefs(paths []string) (map[string]definition, error) {
+	var files []string
+
+	for _, path := range paths {
+		stat, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to access '%v': %+v", path, err)
+		}
+
+		if !stat.IsDir() {
+			files = append(files, path)
+			continue
+		}
+
+		local, err := filepath.Glob(filepath.Join(path, "*.yml"))
+		if err != nil {
+			return nil, fmt.Errorf("finding yml files in '%v' failed: %+v", path, err)
+		}
+		files = append(files, local...)
 	}
 
 	// load definitions
-	var defs []definition
+	defs := map[string]definition{}
 	for _, file := range files {
 		contents, err := ioutil.ReadFile(file)
 		if err != nil {
 			return nil, fmt.Errorf("error reading file %v: %+v", file, err)
 		}
 
-		var fileDefs []definition
+		var fileDefs map[string]definition
 		if err := yaml.Unmarshal(contents, &fileDefs); err != nil {
 			return nil, fmt.Errorf("error parsing file %v: %+v", file, err)
 		}
 
-		defs = append(defs, fileDefs...)
+		for k, v := range fileDefs {
+			defs[k] = v
+		}
 	}
 
 	return defs, nil
 }
 
-func flattenDefs(path string, in []definition) map[string]typeInfo {
+func flattenDefs(path string, in map[string]definition) map[string]typeInfo {
 	filtered := map[string]typeInfo{}
-	for i := range in {
-		fld := &in[i]
-		fldPath := fld.Name
+	for fldPath, fld := range in {
 		if path != "" {
 			fldPath = fmt.Sprintf("%v.%v", path, fldPath)
 		}
@@ -261,25 +316,41 @@ func flattenDefs(path string, in []definition) map[string]typeInfo {
 	return filtered
 }
 
-func buildSchema(version string, defs map[string]typeInfo) *schema {
+func buildSchema(version string, defs map[string]typeInfo, exclude map[string]bool) *schema {
 	s := &schema{
 		Version:    version,
+		Base:       map[string]*value{},
 		Top:        map[string]*namespace{},
 		Namespaces: map[string]*namespace{},
 		Values:     map[string]*value{},
 	}
 
 	for fullName, ti := range defs {
+		if exclude[fullName] {
+			continue
+		}
+
 		fullName = normalizePath(fullName)
 		name, path := splitPath(fullName)
+		isBase := path == "base" || path == ""
 
 		var current *namespace
 		val := &value{
 			Type:     ti,
 			Name:     name,
-			FullName: fullName,
+			FlatName: fullName,
 		}
-		s.Values[fullName] = val
+
+		if isBase {
+			if exclude[name] {
+				continue
+			}
+
+			s.Base[name] = val
+			s.Values[name] = val
+		} else {
+			s.Values[fullName] = val
+		}
 
 		// iterate backwards through fully qualified and build namespaces.
 		// Namespaces and values get dynamically interlinked
@@ -292,7 +363,7 @@ func buildSchema(version string, defs map[string]typeInfo) *schema {
 			if newNS {
 				ns = &namespace{
 					Name:     name,
-					FullName: fullPath,
+					FlatName: fullPath,
 				}
 				s.Namespaces[fullPath] = ns
 			}
@@ -326,10 +397,8 @@ func buildSchema(version string, defs map[string]typeInfo) *schema {
 	return s
 }
 
-func copyDescriptions(schema *schema, root string, defs []definition) {
-	for i := range defs {
-		def := &defs[i]
-		fqName := def.Name
+func copyDescriptions(schema *schema, root string, defs map[string]definition) {
+	for fqName, def := range defs {
 		if root != "" {
 			fqName = fmt.Sprintf("%v.%v", root, fqName)
 		}
@@ -344,7 +413,10 @@ func copyDescriptions(schema *schema, root string, defs []definition) {
 
 				ns.Description = def.Description
 			} else {
-				val := schema.Values[path]
+				val, ok := schema.Values[path]
+				if !ok {
+					continue
+				}
 				if val == nil {
 					panic(fmt.Sprintf("no value for: %v", path))
 				}
@@ -367,7 +439,7 @@ func splitPath(in string) (name, parent string) {
 }
 
 func normalizePath(in string) string {
-	var rootPaths = []string{"base", "ecs"}
+	var rootPaths = []string{"base"}
 
 	for _, path := range rootPaths {
 		if in == path {
@@ -462,7 +534,7 @@ func goTypeName(name string) string {
 func abbreviations(abv string) string {
 	switch strings.ToLower(abv) {
 	case "id", "ppid", "pid", "mac", "ip", "iana", "uid", "ecs", "url", "os",
-		"http", "dns", "ssl", "tls", "ttl":
+		"http", "dns", "ssl", "tls", "ttl", "uuid":
 		return strings.ToUpper(abv)
 	default:
 		return abv
